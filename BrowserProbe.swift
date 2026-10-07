@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import UIKit
+import CryptoKit
 
 @main
 struct BrowserProbeApp: App {
@@ -171,6 +172,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         Task { @MainActor [weak self] in
             guard let self = self else { return }
             var report = "IPHONE WEB SAVED TEST v5\nRead-only; no messages sent.\n"
+            let signingFailures = NativeSigningCore.selfTestFailures()
+            report += signingFailures.isEmpty ? "Offline SM3/MD5/Gorgon checks: passed. Full native request signing is not implemented yet.\n" : "Offline signing checks failed; native requests disabled.\n"
             do {
                 // Read the result through a synchronous string bridge. Do not rely on
                 // iOS 15's conversion of an asynchronously returned JavaScript value.
@@ -331,3 +334,117 @@ struct ProbeScreen: View {
         }
     }
 }
+
+// BEGIN NATIVE SIGNING CORE
+// Experimental offline primitives; signature generation is not proof of API access.
+// Gorgon compatibility reference: iqbalmh18/tiktok-signer, commit c981a8b.
+// MIT License — Copyright (c) 2026 iqbalmh18
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+enum NativeSigningCore {
+    static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
+    static func md5(_ text: String) -> [UInt8] { Array(Insecure.MD5.hash(data: Data(text.utf8))) }
+    static func rotate(_ x: UInt32, _ n: Int) -> UInt32 {
+        let amount = n % 32
+        return amount == 0 ? x : (x << amount) | (x >> (32 - amount))
+    }
+    static func sm3(_ input: [UInt8]) -> [UInt8] {
+        var bytes = input
+        let bitLength = UInt64(bytes.count) * 8
+        bytes.append(0x80)
+        while bytes.count % 64 != 56 { bytes.append(0) }
+        for n in stride(from: 56, through: 0, by: -8) { bytes.append(UInt8(truncatingIfNeeded: bitLength >> n)) }
+        var state: [UInt32] = [0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+                               0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e]
+        for base in stride(from: 0, to: bytes.count, by: 64) {
+            var w = [UInt32](repeating: 0, count: 68)
+            for i in 0..<16 {
+                let p = base + 4*i
+                w[i] = UInt32(bytes[p]) << 24 | UInt32(bytes[p+1]) << 16 | UInt32(bytes[p+2]) << 8 | UInt32(bytes[p+3])
+            }
+            for i in 16..<68 {
+                let x = w[i-16] ^ w[i-9] ^ rotate(w[i-3], 15)
+                w[i] = x ^ rotate(x, 15) ^ rotate(x, 23) ^ rotate(w[i-13], 7) ^ w[i-6]
+            }
+            var a=state[0], b=state[1], c=state[2], d=state[3]
+            var e=state[4], f=state[5], g=state[6], h=state[7]
+            for j in 0..<64 {
+                let t: UInt32 = j < 16 ? 0x79cc4519 : 0x7a879d8a
+                let ss1 = rotate(rotate(a, 12) &+ e &+ rotate(t, j), 7)
+                let ss2 = ss1 ^ rotate(a, 12)
+                let ff = j < 16 ? a ^ b ^ c : (a & b) | (a & c) | (b & c)
+                let gg = j < 16 ? e ^ f ^ g : (e & f) | (~e & g)
+                let tt1 = ff &+ d &+ ss2 &+ (w[j] ^ w[j+4])
+                let tt2 = gg &+ h &+ ss1 &+ w[j]
+                d=c; c=rotate(b,9); b=a; a=tt1
+                h=g; g=rotate(f,19); f=e; e=tt2 ^ rotate(tt2,9) ^ rotate(tt2,17)
+            }
+            let next = [a,b,c,d,e,f,g,h]
+            for i in 0..<8 { state[i] ^= next[i] }
+        }
+        return state.flatMap { word in [24,16,8,0].map { UInt8(truncatingIfNeeded: word >> $0) } }
+    }
+    static func gorgon(query: String, cookie: String?, timestamp: UInt32) -> String {
+        let key = [30,64,224,217,147,69,0,180]
+        var table = Array(0..<256)
+        var last: Int?
+        for i in 0..<256 {
+            var a = i == 0 ? 0 : ((last ?? 0) != 0 ? last! : table[i-1])
+            if a == 85 && i != 1 && last != 85 { a=0 }
+            let c = (a + i + key[i%8]) % 256
+            last = c < i ? c : nil
+            table[i] = table[c]
+        }
+        var input = Array(md5(query).prefix(4)).map(Int.init) + [0,0,0,0]
+        input += cookie.map { Array(md5($0).prefix(4)).map(Int.init) } ?? [0,0,0,0]
+        input += [0,0,0,0]
+        input += [24,16,8,0].map { Int(UInt8(truncatingIfNeeded: timestamp >> $0)) }
+        var temporary = table, previous=0
+        for i in 0..<20 {
+            let c=(table[i+1]+previous)%256
+            previous=c
+            let d=temporary[c]
+            temporary[i+1]=d
+            input[i] ^= temporary[(d+d)%256]
+        }
+        for i in 0..<20 {
+            let swapped=((input[i]&15)<<4)|(input[i]>>4)
+            let x=swapped ^ input[(i+1)%20]
+            var reversed=0
+            for bit in 0..<8 { reversed |= ((x>>bit)&1) << (7-bit) }
+            input[i] = (~(reversed ^ 20)) & 255
+        }
+        return "8404b4d94000" + hex(input.map(UInt8.init))
+    }
+    static func selfTestFailures() -> [String] {
+        var failures: [String] = []
+        if hex(md5("abc")) != "900150983cd24fb0d6963f7d28e17f72" { failures.append("MD5 standard vector") }
+        if hex(sm3(Array("abc".utf8))) != "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0" { failures.append("SM3 standard vector") }
+        // More vectors are inserted from an independent OpenSSL implementation by the build preparer.
+        // BEGIN REFERENCE VECTORS
+        if hex(sm3([])) != "1ab21d8355cfa17f8e61194831e81a8f22bec8c728fefb747ed035eb5082aa2b" { failures.append("SM3 OpenSSL vector 0") }
+        if hex(sm3([97,98,99])) != "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0" { failures.append("SM3 OpenSSL vector 1") }
+        if hex(sm3([97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100,97,98,99,100])) != "debe9ff92275b8a138604889c18e5a4d6fdb70e5387e5765293dcba39c0c5732" { failures.append("SM3 OpenSSL vector 2") }
+        if hex(sm3([120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120])) != "ff8f8d58b95a1f90e39d96f739fa873eee33c0a80e59c7bbbf184eb7d9b1f112" { failures.append("SM3 OpenSSL vector 3") }
+        if hex(sm3([120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120])) != "c4c1c6206d36c325e66ae5432948b26f04acff8dfc0ea2606a79d59b83a16d61" { failures.append("SM3 OpenSSL vector 4") }
+        if hex(sm3([120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120,120])) != "063cfef4083326d61866e4bc3283fca4823f4f771d82a95b76a668454bfb0d24" { failures.append("SM3 OpenSSL vector 5") }
+        if gorgon(query: "aid=1233&cursor=0&count=20", cookie: nil, timestamp: 1700000000) != "8404b4d9400080395c76cf0918c5fbeac413362c8dbaebdbc250" { failures.append("Gorgon reference vector 0") }
+        if gorgon(query: "aid=1233&cursor=0&count=20", cookie: "sessionid=TEST_ONLY", timestamp: 1700000000) != "8404b4d9400080395c76cf0918feee64538e362c8dbaebdbc250" { failures.append("Gorgon reference vector 1") }
+        if gorgon(query: "", cookie: nil, timestamp: 1700000000) != "8404b4d94000c383773acf0918c5fbeac413362c8dbaebdbc292" { failures.append("Gorgon reference vector 2") }
+        // END REFERENCE VECTORS
+        return failures
+    }
+}
+// END NATIVE SIGNING CORE

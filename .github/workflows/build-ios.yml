@@ -9,6 +9,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Verify local signing primitives
+        run: |
+          python3 -c 'from pathlib import Path; s=Path("BrowserProbe.swift").read_text(); core=s.split("// BEGIN NATIVE SIGNING CORE")[1].split("// END NATIVE SIGNING CORE")[0]; Path("/tmp/native-signing-check.swift").write_text("import Foundation\nimport CryptoKit\n"+core+"\nlet failures = NativeSigningCore.selfTestFailures(); if !failures.isEmpty { print(failures); exit(1) }; print(failures.count)\n")'
+          swiftc /tmp/native-signing-check.swift -o /tmp/native-signing-check
+          /tmp/native-signing-check
       - name: Compile without Apple credentials
         run: |
           xcodebuild -project BrowserProbe.xcodeproj -scheme BrowserProbe -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
