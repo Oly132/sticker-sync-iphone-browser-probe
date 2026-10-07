@@ -20,19 +20,48 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private let directReadScript = #"""
     (async () => {
       // Never invoke unknown SDK functions. Inspect names/code only, and issue GETs only.
-      const result = {version: 4, signedIn: false, chatRoot: false, sdkFound: false, readMethods: [],
-        sendMethods: [], apiMethods: [], stickerCodeHint: false, webRequests: []};
+      const result = {version: 5, signedIn: false, chatRoot: false, sdkFound: false, readMethods: [],
+        sendMethods: [], apiMethods: [], stickerCodeHint: false, webRequests: [], domMarkers: []};
+      const schemaKeys = new Set(['status_code','status_msg','message','data','stickers','sticker_list','favorite_stickers',
+        'favorites','list','items','cursor','has_more','hasMore','log_pb','extra','code','success','url_list','url',
+        'sticker','sticker_card','sticker_infos','total','count','image','image_url','video','id','type','sticker_id',
+        'sticker_type','user_sticker_list','favorite_sticker_list','aweme_list','collect_list','status','error','detail']);
+      function shape(value, depth=0) {
+        if (value === null) return 'null';
+        if (depth > 5) return Array.isArray(value)?'array':typeof value;
+        if (Array.isArray(value)) return {arrayLength:value.length, item:value.length?shape(value[0],depth+1):null};
+        if (typeof value === 'object') {
+          const out = {}, keys = Object.keys(value);
+          for (const key of keys.filter(k=>schemaKeys.has(k)).slice(0,30)) out[key]=shape(value[key],depth+1);
+          const omitted = keys.filter(k=>!schemaKeys.has(k)).length;
+          if (omitted) out.otherFieldCount = omitted;
+          return out;
+        }
+        return typeof value;
+      }
       try {
         const scope = JSON.parse(document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__')?.textContent || '{}').__DEFAULT_SCOPE__;
         result.signedIn = !!scope?.['webapp.app-context']?.user?.uid;
       } catch (_) {}
       const root = document.querySelector('[data-e2e="dm-new-chatbox"]');
       result.chatRoot = !!root;
-      let fiber = root?.[Object.keys(root).find(k => k.startsWith('__reactFiber'))], instance;
-      for (let depth = 0; fiber && depth < 80; depth++, fiber = fiber.return) {
-        const p = fiber.memoizedProps;
-        if (p?.instance) instance = p.instance;
-        if (p?.value?.instance) instance = p.value.instance;
+      const marked = Array.from(document.querySelectorAll('[data-e2e]'));
+      result.domMarkers = [...new Set(marked.map(e=>e.getAttribute('data-e2e'))
+        .filter(n=>/^(dm|im|chat|message|conversation|sticker|emoji)[-_a-z0-9]{0,80}$/i.test(n)))].slice(0,40);
+      const candidates = [root, ...marked.filter(e=>/chat|message|conversation|sticker/i.test(e.getAttribute('data-e2e')||'')),
+        ...Array.from(document.querySelectorAll('[class*="Chat"],[class*="Message"],[class*="Conversation"]'))].filter(Boolean).slice(0,100);
+      let instance;
+      const visited = new Set();
+      for (const element of candidates) {
+        let fiber = element[Object.keys(element).find(k=>k.startsWith('__reactFiber'))];
+        for (let depth = 0; fiber && depth < 80; depth++, fiber = fiber.return) {
+          if (visited.has(fiber)) break;
+          visited.add(fiber);
+          const p = fiber.memoizedProps;
+          const candidate = p?.instance || p?.value?.instance;
+          if (candidate && typeof candidate.getConversation === 'function') { instance = candidate; break; }
+        }
+        if (instance) break;
       }
       if (instance) {
         result.sdkFound = true;
@@ -61,7 +90,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         result.apiMethods = [...apiNames].slice(0,40);
       }
       if (!result.signedIn) return JSON.stringify(result);
-      const paths = ['/tiktok/v1/im/sticker/favorites', '/tiktok/v2/im/sticker/favorites', '/api/im/sticker/favorites/'];
+      // A known-nonexistent control distinguishes generic HTTP-200 JSON fallback
+      // from a working API. Never treat status_code:0 alone as Saved access.
+      const paths = ['/tiktok/v1/im/sticker/favorites', '/tiktok/v2/im/sticker/favorites', '/api/im/sticker/favorites/', '/api/stickersync_probe_missing_route/'];
       result.webRequests = await Promise.all(paths.map(async path => {
         const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 7000);
         try {
@@ -72,6 +103,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
           const stickers = json?.stickers ?? json?.data?.stickers;
           return {path, http:response.status, json:!!json, stickerArray:Array.isArray(stickers),
             stickerCount:Array.isArray(stickers)?stickers.length:0,
+            schema:json?shape(json):null,
             statusCode:typeof json?.status_code==='number'?json.status_code:null};
         } catch (error) { return {path, error:error.name==='AbortError'?'timeout':'request unavailable'}; }
         finally { clearTimeout(timer); }
@@ -138,7 +170,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         savedReport = ""
         Task { @MainActor [weak self] in
             guard let self = self else { return }
-            var report = "IPHONE WEB SAVED TEST v4\nRead-only; no messages sent.\n"
+            var report = "IPHONE WEB SAVED TEST v5\nRead-only; no messages sent.\n"
             do {
                 // Read the result through a synchronous string bridge. Do not rely on
                 // iOS 15's conversion of an asynchronously returned JavaScript value.
@@ -151,7 +183,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                   \(self.directReadScript).then(result => {
                     if (window.__stickerSavedDiagnostic?.token === token) window.__stickerSavedDiagnostic.result = result;
                   }).catch(() => {
-                    if (window.__stickerSavedDiagnostic?.token === token) window.__stickerSavedDiagnostic.result = JSON.stringify({version:4,error:'web inspection failed'});
+                    if (window.__stickerSavedDiagnostic?.token === token) window.__stickerSavedDiagnostic.result = JSON.stringify({version:5,error:'web inspection failed'});
                   });
                   return 'started';
                 })()
