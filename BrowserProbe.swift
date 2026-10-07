@@ -4,6 +4,13 @@ import UIKit
 import CryptoKit
 import CommonCrypto
 
+final class NativeResearchSession: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 @main
 struct BrowserProbeApp: App {
     var body: some Scene { WindowGroup { ProbeScreen() } }
@@ -164,6 +171,83 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         inspect(generation: diagnosticGeneration, remaining: 10)
     }
 
+    func testSignedNative() {
+        guard !testingSaved, let page=web.url, trusted(page) else { return }
+        guard NativeSigningCore.selfTestFailures().isEmpty else {
+            savedReport="Signing self-tests failed. No requests made."; showingReport=true; return
+        }
+        diagnosticGeneration += 1; testingSaved=true
+        status="Testing local request signatures. No messages will be sent."
+        Task { @MainActor [weak self] in
+            guard let self=self else { return }
+            defer { self.testingSaved=false; self.showingReport=true }
+            var report="SIGNED SAVED EXPERIMENT v6\nRead-only; no messages sent.\nOffline crypto checks: passed (16 vectors).\nReference profile: Android 37.0.4; server-registered identity: not established.\n"
+            let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+                self.web.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning:$0) }
+            }
+            let allowed=Set(["sessionid","sessionid_ss","sid_tt","sid_guard","store-idc","store-country-code","store-country-code-src","ttwid"])
+            let selected=cookies.filter {
+                let host=$0.domain.trimmingCharacters(in:CharacterSet(charactersIn:".")).lowercased()
+                return (host=="tiktok.com" || host.hasSuffix(".tiktok.com")) && allowed.contains($0.name)
+            }
+            guard selected.contains(where:{["sessionid","sessionid_ss","sid_tt"].contains($0.name)}) else {
+                self.savedReport=report+"No signed-in TikTok session available. Sign into TikTok first."; return
+            }
+            let cookieHeader=selected.map { "\($0.name)=\($0.value)" }.joined(separator:"; ")
+            let idc=selected.first(where:{$0.name=="store-idc"})?.value ?? ""
+            let host=idc.contains("alisg") ? "api16-normal-c-alisg.tiktokv.com" : idc.contains("maliva") ? "api16-normal-c-useast1a.tiktokv.com" : "api-va.tiktokv.com"
+            let profileKey="nativeResearchDeviceID"
+            let deviceID=UserDefaults.standard.string(forKey:profileKey) ?? String(UInt64.random(in:1_000_000_000_000_000_000...8_000_000_000_000_000_000))
+            UserDefaults.standard.set(deviceID,forKey:profileKey)
+            var components=URLComponents()
+            components.queryItems=[URLQueryItem(name:"aid",value:"1233"),URLQueryItem(name:"app_name",value:"musical_ly"),
+                URLQueryItem(name:"device_platform",value:"android"),URLQueryItem(name:"device_id",value:deviceID),
+                URLQueryItem(name:"device_type",value:"2203121C"),URLQueryItem(name:"os_version",value:"9"),
+                URLQueryItem(name:"channel",value:"googleplay"),URLQueryItem(name:"version_name",value:"37.0.4"),
+                URLQueryItem(name:"version_code",value:"370004"),URLQueryItem(name:"cursor",value:"0"),
+                URLQueryItem(name:"count",value:"20"),URLQueryItem(name:"in_house_tenor",value:"true"),URLQueryItem(name:"source",value:"dm")]
+            let query=components.percentEncodedQuery!
+            let config=URLSessionConfiguration.ephemeral
+            config.httpCookieStorage=nil; config.urlCredentialStorage=nil
+            config.timeoutIntervalForRequest=7; config.timeoutIntervalForResource=9
+            let session=URLSession(configuration:config,delegate:NativeResearchSession(),delegateQueue:nil)
+            defer { session.invalidateAndCancel() }
+            let cases:[(String,Bool)]=[("v2",false),("v2",true),("v1",true)]
+            for (version,signed) in cases {
+                guard let page=self.web.url,self.trusted(page) else { report += "Page changed; test stopped.\n"; break }
+                let label="\(signed ? "signed" : "unsigned") \(version)"
+                let url=URL(string:"https://\(host)/tiktok/\(version)/im/sticker/favorites?\(query)")!
+                var request=URLRequest(url:url);request.httpMethod="GET"
+                request.setValue(cookieHeader,forHTTPHeaderField:"Cookie")
+                request.setValue("com.zhiliaoapp.musically/2023700040 (Linux; U; Android 9; en_US; 2203121C; Build/PKQ1; Cronet/TTNetVersion:5)",forHTTPHeaderField:"User-Agent")
+                request.setValue("application/json",forHTTPHeaderField:"Accept")
+                if signed {
+                    let timestamp=UInt32(Date().timeIntervalSince1970)
+                    let salt=(0..<4).map { _ in UInt8.random(in:0...255) }
+                    do {
+                        request.setValue(NativeSigningCore.gorgon(query:query,cookie:cookieHeader,timestamp:timestamp),forHTTPHeaderField:"x-gorgon")
+                        request.setValue(String(timestamp),forHTTPHeaderField:"x-khronos")
+                        request.setValue(String(UInt64(timestamp)*1000),forHTTPHeaderField:"x-ss-req-ticket")
+                        request.setValue(NativeSigningCore.ladon(timestamp:timestamp,salt:salt),forHTTPHeaderField:"x-ladon")
+                        request.setValue(try NativeSigningCore.argus(query:query,deviceID:deviceID,timestamp:timestamp,nonce:UInt32.random(in:0...0x7fffffff)),forHTTPHeaderField:"x-argus")
+                    } catch { report += "\(label): signing failed; request skipped.\n"; continue }
+                }
+                do {
+                    let (data,response)=try await session.data(for:request)
+                    let http=response as? HTTPURLResponse
+                    let json=data.count<2_000_000 ? (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] : nil
+                    let nested=json?["data"] as? [String:Any]
+                    let list=(json?["stickers"] ?? nested?["stickers"]) as? [Any]
+                    let code=(json?["status_code"] as? NSNumber)?.stringValue ?? "unavailable"
+                    let text=String(data:Data(data.prefix(100_000)),encoding:.utf8)?.lowercased() ?? ""
+                    report += "\(host) \(label): HTTP \(http?.statusCode ?? 0), JSON \(json != nil), status \(code), stickerArray \(list != nil), count \(list?.count ?? 0), accessDeniedText \(text.contains("access denied") || text.contains("accessdenied"))\n"
+                } catch { report += "\(host) \(label): request unavailable or timed out\n" }
+            }
+            self.savedReport=report+"A matching signature is not proof of native login or Saved access. No transfers performed."
+            self.status="Signed experiment finished. Copy the report for review."
+        }
+    }
+
     func testSaved() {
         guard !testingSaved, let page = web.url, trusted(page) else { return }
         diagnosticGeneration += 1
@@ -315,7 +399,9 @@ struct ProbeScreen: View {
                 Button("Reload") { model.web.reload() }
             }.buttonStyle(.bordered).tint(mint)
             Button("Check chat") { model.checkChat() }.buttonStyle(.bordered).tint(mint)
-            Button(model.testingSaved ? "Testing Saved…" : "Test Saved access · v4") { model.testSaved() }
+            Button(model.testingSaved ? "Testing Saved…" : "Test Saved access · v5") { model.testSaved() }
+                .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
+            Button("Test signed request · v6") { model.testSignedNative() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
             Text(model.status).font(.footnote).foregroundColor(.white).accessibilityLabel(model.status)
             BrowserSurface(web: model.web).clipShape(RoundedRectangle(cornerRadius: 16))
