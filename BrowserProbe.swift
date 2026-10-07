@@ -3,6 +3,7 @@ import WebKit
 import UIKit
 import CryptoKit
 import CommonCrypto
+import zlib
 
 final class NativeResearchSession: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -181,7 +182,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         Task { @MainActor [weak self] in
             guard let self=self else { return }
             defer { self.testingSaved=false; self.showingReport=true }
-            var report="SIGNED SAVED EXPERIMENT v6\nRead-only; no messages sent.\nOffline crypto checks: passed (16 vectors).\nReference profile: Android 37.0.4; server-registered identity: not established.\n"
+            var report="SIGNED SAVED EXPERIMENT v7\nRead-only; no messages sent.\nOffline crypto checks: passed (\(NativeSigningCore.checkCount) vectors).\nReference profile: Android 37.0.4; server-registered identity: not established.\n"
             let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
                 self.web.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning:$0) }
             }
@@ -401,7 +402,7 @@ struct ProbeScreen: View {
             Button("Check chat") { model.checkChat() }.buttonStyle(.bordered).tint(mint)
             Button(model.testingSaved ? "Testing Saved…" : "Test Saved access · v5") { model.testSaved() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
-            Button("Test signed request · v6") { model.testSignedNative() }
+            Button("Test signed request · v7") { model.testSignedNative() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
             Text(model.status).font(.footnote).foregroundColor(.white).accessibilityLabel(model.status)
             BrowserSurface(web: model.web).clipShape(RoundedRectangle(cornerRadius: 16))
@@ -441,6 +442,7 @@ struct ProbeScreen: View {
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 enum NativeSigningCore {
+    static let checkCount = 24
     static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
     static func md5(_ text: String) -> [UInt8] { Array(Insecure.MD5.hash(data: Data(text.utf8))) }
     static func rotate(_ x: UInt32, _ n: Int) -> UInt32 {
@@ -483,7 +485,7 @@ enum NativeSigningCore {
         }
         return state.flatMap { word in [24,16,8,0].map { UInt8(truncatingIfNeeded: word >> $0) } }
     }
-    static func gorgon(query: String, cookie: String?, timestamp: UInt32) -> String {
+    static func gorgon(query: String, cookie: String?, timestamp: UInt32, body: [UInt8]? = nil) -> String {
         let key = [30,64,224,217,147,69,0,180]
         var table = Array(0..<256)
         var last: Int?
@@ -494,7 +496,8 @@ enum NativeSigningCore {
             last = c < i ? c : nil
             table[i] = table[c]
         }
-        var input = Array(md5(query).prefix(4)).map(Int.init) + [0,0,0,0]
+        var input = Array(md5(query).prefix(4)).map(Int.init)
+        input += body.map { Array(Insecure.MD5.hash(data:Data($0)).prefix(4)).map(Int.init) } ?? [0,0,0,0]
         input += cookie.map { Array(md5($0).prefix(4)).map(Int.init) } ?? [0,0,0,0]
         input += [0,0,0,0]
         input += [24,16,8,0].map { Int(UInt8(truncatingIfNeeded: timestamp >> $0)) }
@@ -588,13 +591,15 @@ enum NativeSigningCore {
         guard result == kCCSuccess else { throw SigningError.aesFailed }
         return Array(output.prefix(written))
     }
-    static func argus(query: String, deviceID: String, timestamp: UInt32, nonce: UInt32) throws -> String {
+    static func argus(query: String, deviceID: String, timestamp: UInt32, nonce: UInt32, body: [UInt8]? = nil) throws -> String {
         var pb=PB()
         pb.integer(1,0x20200929<<1); pb.integer(2,2); pb.integer(3,UInt64(nonce))
         pb.text(4,"1233"); pb.text(5,deviceID); pb.text(6,"2142840551")
         pb.text(7,"v05.01.02-alpha.7-ov-android"); pb.text(8,"v05.01.02-alpha.7-ov-android")
         pb.integer(9,83952160); pb.data(10,[UInt8](repeating:0,count:8)); pb.text(11,"android")
-        pb.integer(12,UInt64(timestamp)<<1); pb.data(13,Array(sm3([UInt8](repeating:0,count:16)).prefix(6)))
+        pb.integer(12,UInt64(timestamp)<<1)
+        let bodyDigest=body.map { Array(Insecure.MD5.hash(data:Data($0))) } ?? [UInt8](repeating:0,count:16)
+        pb.data(13,Array(sm3(bodyDigest).prefix(6)))
         pb.data(14,Array(sm3(query.isEmpty ? [UInt8](repeating:0,count:16) : Array(query.utf8)).prefix(6)))
         var counters=PB()
         for field in [UInt64(1),2,3,5,6] { counters.integer(field,field==6 ? 170 : 85) }
@@ -613,6 +618,35 @@ enum NativeSigningCore {
         let iv=Array(Insecure.MD5.hash(data:Data(signKey.suffix(16))))
         return Data([0xf2,0x81] + (try aesCBC(buffer,key:aesKey,iv:iv))).base64EncodedString()
     }
+    static func gzip(_ input: [UInt8]) throws -> [UInt8] {
+        guard !input.isEmpty && input.count<=1_000_000 else { throw SigningError.aesFailed }
+        var stream=z_stream()
+        guard deflateInit2_(&stream,9,Z_DEFLATED,MAX_WBITS+16,8,Z_DEFAULT_STRATEGY,ZLIB_VERSION,Int32(MemoryLayout<z_stream>.size)) == Z_OK else { throw SigningError.aesFailed }
+        defer { deflateEnd(&stream) }
+        var output=[UInt8](repeating:0,count:input.count+input.count/16+128)
+        let capacity=output.count
+        let code=input.withUnsafeBytes { raw in output.withUnsafeMutableBytes { out in
+            stream.next_in=UnsafeMutablePointer<Bytef>(mutating:raw.bindMemory(to:Bytef.self).baseAddress)
+            stream.avail_in=uInt(input.count)
+            stream.next_out=out.bindMemory(to:Bytef.self).baseAddress
+            stream.avail_out=uInt(capacity)
+            return deflate(&stream,Z_FINISH)
+        }}
+        guard code == Z_STREAM_END else { throw SigningError.aesFailed }
+        var compressed=Array(output.prefix(Int(stream.total_out)))
+        // Match the historical request envelope's deterministic gzip header.
+        compressed.replaceSubrange(0..<10,with:[31,139,8,0,0,0,0,0,0,0])
+        return compressed
+    }
+    static func deviceEnvelope(gzip compressed: [UInt8], salt: [UInt8]) throws -> [UInt8] {
+        guard salt.count==32 && compressed.count>=10 && compressed[0]==31 && compressed[1]==139 else { throw SigningError.aesFailed }
+        // BEGIN DEVICE ENVELOPE ORD
+        let ord: [UInt8] = [77, 212, 194, 230, 184, 49, 98, 9, 14, 82, 179, 199, 166, 115, 59, 164, 28, 178, 70, 43, 130, 154, 181, 138, 25, 107, 57, 219, 87, 23, 117, 36, 244, 155, 175, 127, 8, 232, 214, 141, 38, 167, 46, 55, 193, 169, 90, 47, 31, 5, 165, 24, 146, 174, 242, 148, 151, 50, 182, 42, 56, 170, 221, 88]
+        // END DEVICE ENVELOPE ORD
+        let material=Array(SHA512.hash(data:Data(Array(SHA512.hash(data:Data(salt)))+ord)))
+        let plaintext=Array(SHA512.hash(data:Data(compressed)))+compressed
+        return [0x74,0x63,0x05,0x10,0,0]+salt+(try aesCBC(plaintext,key:Array(material.prefix(16)),iv:Array(material[16..<32])))
+    }
     static func selfTestFailures() -> [String] {
         var failures: [String] = []
         if hex(md5("abc")) != "900150983cd24fb0d6963f7d28e17f72" { failures.append("MD5 standard vector") }
@@ -628,11 +662,19 @@ enum NativeSigningCore {
         if gorgon(query: "aid=1233&cursor=0&count=20", cookie: nil, timestamp: 1700000000) != "8404b4d9400080395c76cf0918c5fbeac413362c8dbaebdbc250" { failures.append("Gorgon reference vector 0") }
         if gorgon(query: "aid=1233&cursor=0&count=20", cookie: "sessionid=TEST_ONLY", timestamp: 1700000000) != "8404b4d9400080395c76cf0918feee64538e362c8dbaebdbc250" { failures.append("Gorgon reference vector 1") }
         if gorgon(query: "", cookie: nil, timestamp: 1700000000) != "8404b4d94000c383773acf0918c5fbeac413362c8dbaebdbc292" { failures.append("Gorgon reference vector 2") }
+        if gorgon(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", cookie: nil, timestamp: 1700000000, body: [123, 34, 116, 101, 115, 116, 34, 58, 116, 114, 117, 101, 125]) != "8404b4d94000d056ebafa2f7b19dfbeac413362c8dbaebdbc25a" { failures.append("Gorgon reference vector 3") }
         if ladon(timestamp: 1700000000, salt: [1, 2, 3, 4]) != "AQIDBAg9q7y2FKMM0eeGFk1n4W/Q28AxEuIoF+PlPOv0uX8J" { failures.append("Ladon cross-implementation vector 0") }
         if ladon(timestamp: 1700000011, salt: [1, 2, 3, 4]) != "AQIDBHORJ1wUm5sIC7JwffyEwZ/Q28AxEuIoF+PlPOv0uX8J" { failures.append("Ladon cross-implementation vector 1") }
         do { if try argus(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", deviceID: "1234567890123456789", timestamp: 1700000000, nonce: 12345) != "8oGq9ypdP1R0Yt46uZPVHJHqYFS0vSftUDt8DpMHZDglY9Iiysy8LMUU9iNg1u8DPGexO0LNLtdl7TSrbLLZ1TkJU4T1/BhqlkPDyDC82laua2mtBpq/ZE1NS4wClgAnRCS4ocWgLl6CXjfJBcndZoXuVvKh4qObIZk1bxbCrnoT/0d3yMMb6jH6D3+0n65X5LFCjc19oKlqr/7U1Yt61NW2ftm7Xu2v3iN9zr5eb3R1Bk+WKUJieuU4rUOnL2eSshf5B3WzKvwpeoNjGFih2Td3lJSWJ4S9qn8mDmAjOaKwJH7kIHUs9uai32E67nT7u54oOMTIZXGsRhgnucBTMQOkluPtrZlDtLHzWCywXmICqLfo6ztQGvqBVqzapB4S4Jc=" { failures.append("Argus compatibility vector 0") } } catch { failures.append("Argus AES failure") }
         do { if try argus(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", deviceID: "1234567890123456789", timestamp: 1700000011, nonce: 12345) != "8oGq9ypdP1R0Yt46uZPVHJHqYFS0vSftUDt8DpMHZDglY9Iiysy8LMUU9iNg1u8DPGexO0LNLtdl7TSrbLLZ1TkJU4T1/BhqlkPDyDC82laua4Jzt8nshHrvoWNFgblLMlFE3TrdnGjgi+M2GKC8zwDbvaMi93OAA7TRUHDvrofgt2Umqk2PyJXepRnpmb5/GnFXpPwXcWa3dyAIfm6quMNyB6FTASv33bmgzHO9muraZgGq4g2rWfcJnwx9fB7R4BaSNQ7421uqFH7aCaWisEZYM+N31vuFTLfOgdU5PY5I84RONS1Efqu/1l1UOWSKVmx+PlwXLCEU6NAIeWPmnf1IiF9cpz1n8+6w1ULUDro+Fu+IRutn1FjVrZR7hper6PY=" { failures.append("Argus compatibility vector 1") } } catch { failures.append("Argus AES failure") }
+        do { if try argus(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", deviceID: "1234567890123456789", timestamp: 1700000000, nonce: 12345, body: [123, 34, 116, 101, 115, 116, 34, 58, 116, 114, 117, 101, 125]) != "8oGq9ypdP1R0Yt46uZPVHJHqYFS0vSftUDt8DpMHZDglY9Iiysy8LMUU9iNg1u8DPGexO0LNLtdl7TSrbLLZ1TkJU4T1/BhqlkPDyDC82laua2mtBpq/ZE1NS4wClgAnRCRxiCLR8cS6o9C/CI4fE5jdHVUdCE8dV8SSRH2nXfTeLzgcftfJ4ekXa7g4Xmc2pgf11V4SMu+S1c8j8+5+eY2lPVhmA1dok3gd63vJbfu7AtIsfxRAPH+5XWf/q7IshVg/5cvF22SxM68XLgac7HmOaD5leMYnoZaOhUyvgtDF7ZD+UgbbkLCZyznZIxz2LqZh9sX5cQNERpFyNYi3tuRh4B5YOESdssKHi8Fd04Rdzz+okXz048byJHcTXO7jmhE=" { failures.append("Argus compatibility vector 2") } } catch { failures.append("Argus AES failure") }
         do { if hex(try aesCBC([107, 193, 190, 226, 46, 64, 159, 150, 233, 61, 126, 17, 115, 147, 23, 42], key: [43, 126, 21, 22, 40, 174, 210, 166, 171, 247, 21, 136, 9, 207, 79, 60], iv: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])) != "7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c" { failures.append("AES NIST/padding vector 0") } } catch { failures.append("AES failure") }
+        do { if try gzip([97, 98, 99]) != [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 75, 76, 74, 6, 0, 194, 65, 36, 53, 3, 0, 0, 0] { failures.append("Gzip independent vector 0") } } catch { failures.append("Gzip failure") }
+        do { if hex(try deviceEnvelope(gzip: [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 75, 76, 74, 6, 0, 194, 65, 36, 53, 3, 0, 0, 0], salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])) != "746305100000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ffacc9c51c7ee2e0f0e202598aaa40f41ba0c4018ff81dd07de04b2ae8c362c85f5b1e5c8cfddd91f6b6f221621714d37e80fede82e7f8bf9b33998bf0c43aba62f3beae9ea577b06ed0c97aa79ed311a7630728871cc5a2fe1e4747bd5df60bb" { failures.append("Device envelope independent vector 0") } } catch { failures.append("Device envelope failure") }
+        do { if try gzip([123, 34, 109, 97, 103, 105, 99, 95, 116, 97, 103, 34, 58, 34, 115, 115, 95, 97, 112, 112, 95, 108, 111, 103, 34, 44, 34, 104, 101, 97, 100, 101, 114, 34, 58, 123, 34, 97, 105, 100, 34, 58, 49, 50, 51, 51, 125, 125]) != [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 171, 86, 202, 77, 76, 207, 76, 142, 47, 73, 76, 87, 178, 82, 42, 46, 142, 79, 44, 40, 136, 207, 201, 79, 87, 210, 81, 202, 72, 77, 76, 73, 45, 82, 178, 170, 86, 74, 204, 76, 81, 178, 50, 52, 50, 54, 174, 173, 5, 0, 169, 164, 28, 12, 48, 0, 0, 0] { failures.append("Gzip independent vector 1") } } catch { failures.append("Gzip failure") }
+        do { if hex(try deviceEnvelope(gzip: [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 171, 86, 202, 77, 76, 207, 76, 142, 47, 73, 76, 87, 178, 82, 42, 46, 142, 79, 44, 40, 136, 207, 201, 79, 87, 210, 81, 202, 72, 77, 76, 73, 45, 82, 178, 170, 86, 74, 204, 76, 81, 178, 50, 52, 50, 54, 174, 173, 5, 0, 169, 164, 28, 12, 48, 0, 0, 0], salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])) != "746305100000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f421262e77a18e23251d60ec2d7f23c0a9056ce5a84265f13a57ff077310bcc15fcdd25d24a3c0728adbb702bf069d098c4c31face5b1d4c5c278dd442293f1757664df6526af604b8175d535d215edc16648191fee186d4edb6ddb1054290bb5559ff65eb9195c08182bde430940dc36d14f2612c6e9729448ef74c6991fc758c5658a4e4cb76a80f8883cf710ac6129" { failures.append("Device envelope independent vector 1") } } catch { failures.append("Device envelope failure") }
+        do { if try gzip([65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65]) != [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 115, 116, 28, 30, 0, 0, 152, 61, 187, 40, 200, 0, 0, 0] { failures.append("Gzip independent vector 2") } } catch { failures.append("Gzip failure") }
+        do { if hex(try deviceEnvelope(gzip: [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 115, 116, 28, 30, 0, 0, 152, 61, 187, 40, 200, 0, 0, 0], salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])) != "746305100000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ff964d20e50e09c9ed2085cbaeb9b64b0c234c20b8be11a9fcbdf3967fcec3c3811bd26705fec868f4e56478cb1be6e669008f79b08f7a1920457cdd528b245d8173b4ee8db003e389871049b11d4d35fa4132520353d3607aa4699d5eb4ed060" { failures.append("Device envelope independent vector 2") } } catch { failures.append("Device envelope failure") }
         // END REFERENCE VECTORS
         return failures
     }

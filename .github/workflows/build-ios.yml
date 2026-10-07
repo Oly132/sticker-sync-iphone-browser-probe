@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify local signing primitives
         run: |
-          python3 -c 'from pathlib import Path; s=Path("BrowserProbe.swift").read_text(); core=s.split("// BEGIN NATIVE SIGNING CORE")[1].split("// END NATIVE SIGNING CORE")[0]; Path("/tmp/native-signing-check.swift").write_text("import Foundation\nimport CryptoKit\nimport CommonCrypto\n"+core+"\nlet failures = NativeSigningCore.selfTestFailures(); if !failures.isEmpty { print(failures); exit(1) }; print(failures.count)\n")'
+          python3 -c 'from pathlib import Path; s=Path("BrowserProbe.swift").read_text(); core=s.split("// BEGIN NATIVE SIGNING CORE")[1].split("// END NATIVE SIGNING CORE")[0]; Path("/tmp/native-signing-check.swift").write_text("import Foundation\nimport CryptoKit\nimport CommonCrypto\nimport zlib\n"+core+"\nlet failures = NativeSigningCore.selfTestFailures(); if !failures.isEmpty { print(failures); exit(1) }; print(NativeSigningCore.checkCount)\n")'
           swiftc /tmp/native-signing-check.swift -o /tmp/native-signing-check
           /tmp/native-signing-check
       - name: Compile without Apple credentials
