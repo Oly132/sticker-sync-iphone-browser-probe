@@ -2,14 +2,6 @@ import SwiftUI
 import WebKit
 import UIKit
 
-final class NoRedirectProbe: NSObject, URLSessionTaskDelegate {
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
-                    completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil)
-    }
-}
-
 @main
 struct BrowserProbeApp: App {
     var body: some Scene { WindowGroup { ProbeScreen() } }
@@ -28,13 +20,14 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private let directReadScript = #"""
     (async () => {
       // Never invoke unknown SDK functions. Inspect names/code only, and issue GETs only.
-      const result = {version: 3, signedIn: false, sdkFound: false, readMethods: [],
-        sendMethods: [], stickerCodeHint: false, webRequests: []};
+      const result = {version: 4, signedIn: false, chatRoot: false, sdkFound: false, readMethods: [],
+        sendMethods: [], apiMethods: [], stickerCodeHint: false, webRequests: []};
       try {
         const scope = JSON.parse(document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__')?.textContent || '{}').__DEFAULT_SCOPE__;
         result.signedIn = !!scope?.['webapp.app-context']?.user?.uid;
       } catch (_) {}
       const root = document.querySelector('[data-e2e="dm-new-chatbox"]');
+      result.chatRoot = !!root;
       let fiber = root?.[Object.keys(root).find(k => k.startsWith('__reactFiber'))], instance;
       for (let depth = 0; fiber && depth < 80; depth++, fiber = fiber.return) {
         const p = fiber.memoizedProps;
@@ -54,6 +47,18 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         result.readMethods = [...names].filter(n => /sticker|favorite|favourite/i.test(n) && /^(get|fetch|list|load|pull)/i.test(n)).slice(0,30);
         result.sendMethods = [...names].filter(n => /^(sendMessage|createMessage|sendSticker|send.*Sticker)$/i.test(n)).slice(0,15);
+        // API containers may expose functions absent from the SDK instance itself.
+        const containers = [instance.api, ...(Array.isArray(instance.plugins) ? instance.plugins.map(p => p?.api) : [])];
+        const apiNames = new Set();
+        for (const container of containers) {
+          for (let p = container, d = 0; p && d < 4; p = Object.getPrototypeOf(p), d++) {
+            for (const name of Object.getOwnPropertyNames(p)) {
+              const descriptor = Object.getOwnPropertyDescriptor(p, name);
+              if (typeof descriptor?.value === 'function' && /sticker|favorite|favourite|sendMessage/i.test(name)) apiNames.add(name);
+            }
+          }
+        }
+        result.apiMethods = [...apiNames].slice(0,40);
       }
       if (!result.signedIn) return JSON.stringify(result);
       const paths = ['/tiktok/v1/im/sticker/favorites', '/tiktok/v2/im/sticker/favorites', '/api/im/sticker/favorites/'];
@@ -133,67 +138,40 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         savedReport = ""
         Task { @MainActor [weak self] in
             guard let self = self else { return }
-            var report = "IPHONE DIRECT SAVED TEST v3\nRead-only; no messages sent.\n"
+            var report = "IPHONE WEB SAVED TEST v4\nRead-only; no messages sent.\n"
             do {
-                let value = try await self.web.callAsyncJavaScript("return await " + self.directReadScript,
-                    arguments: [:], in: nil, in: .page)
-                if let json = value as? String { report += "Web client: \(json)\n" }
-                else { report += "Web client: no diagnostic result\n" }
-            } catch { report += "Web client: inspection unavailable\n" }
-            let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
-                self.web.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning: $0) }
-            }
-            let allowed = Set(["sessionid", "sessionid_ss", "sid_tt", "sid_guard", "store-idc", "store-country-code", "store-country-code-src", "ttwid"])
-            let selected = cookies.filter {
-                let host = $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
-                return (host == "tiktok.com" || host.hasSuffix(".tiktok.com")) && allowed.contains($0.name)
-            }
-            let hasSession = selected.contains { ["sessionid", "sessionid_ss", "sid_tt"].contains($0.name) }
-            if hasSession {
-                // Reuse only this app's TikTok session in memory, only with these TikTok API hosts.
-                // Do not follow redirects or put credentials, response bodies, media URLs or IDs in reports.
-                let config = URLSessionConfiguration.ephemeral
-                config.httpCookieStorage = nil
-                config.urlCredentialStorage = nil
-                config.timeoutIntervalForRequest = 7
-                config.timeoutIntervalForResource = 9
-                let session = URLSession(configuration: config, delegate: NoRedirectProbe(), delegateQueue: nil)
-                let cookieHeader = selected.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-                let hosts = ["api.tiktokv.com", "api-va.tiktokv.com", "api16-normal-c-useast1a.tiktokv.com"]
-                let nativeResults = await withTaskGroup(of: String.self, returning: [String].self) { group in
-                    for host in hosts {
-                        group.addTask {
-                            var lines: [String] = []
-                            for version in ["v1", "v2"] {
-                                let path = "/tiktok/\(version)/im/sticker/favorites"
-                                let url = URL(string: "https://\(host)\(path)?aid=1233&cursor=0&count=20&in_house_tenor=true&source=dm")!
-                                var request = URLRequest(url: url)
-                                request.httpMethod = "GET"
-                                request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-                                request.setValue(self.desktopAgent, forHTTPHeaderField: "User-Agent")
-                                do {
-                                    let (data, response) = try await session.data(for: request)
-                                    let http = (response as? HTTPURLResponse)?.statusCode ?? 0
-                                    let json = data.count < 2000000 ? (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] : nil
-                                    let nested = json?["data"] as? [String: Any]
-                                    let stickers = (json?["stickers"] ?? nested?["stickers"]) as? [Any]
-                                    let code = (json?["status_code"] as? NSNumber)?.stringValue ?? "unavailable"
-                                    lines.append("\(host) \(version): HTTP \(http), JSON \(json != nil), stickerArray \(stickers != nil), count \(stickers?.count ?? 0), status \(code)")
-                                } catch { lines.append("\(host) \(version): request unavailable or timed out") }
-                            }
-                            return lines.joined(separator: "\n")
-                        }
-                    }
-                    var values: [String] = []
-                    for await value in group { values.append(value) }
-                    return values.sorted()
+                // Read the result through a synchronous string bridge. Do not rely on
+                // iOS 15's conversion of an asynchronously returned JavaScript value.
+                let token = UUID().uuidString
+                let tokenJSON = "\"\(token)\""
+                let launch = """
+                (() => {
+                  const token = \(tokenJSON);
+                  window.__stickerSavedDiagnostic = {token, result:null};
+                  \(self.directReadScript).then(result => {
+                    if (window.__stickerSavedDiagnostic?.token === token) window.__stickerSavedDiagnostic.result = result;
+                  }).catch(() => {
+                    if (window.__stickerSavedDiagnostic?.token === token) window.__stickerSavedDiagnostic.result = JSON.stringify({version:4,error:'web inspection failed'});
+                  });
+                  return 'started';
+                })()
+                """
+                _ = try await self.web.evaluateJavaScript(launch)
+                var webResult: String?
+                for _ in 0..<24 {
+                    let value = try await self.web.evaluateJavaScript("window.__stickerSavedDiagnostic?.token === \(tokenJSON) ? window.__stickerSavedDiagnostic.result : null")
+                    if let json = value as? String { webResult = json; break }
+                    try await Task.sleep(nanoseconds: 500_000_000)
                 }
-                session.invalidateAndCancel()
-                report += nativeResults.joined(separator: "\n")
-            } else { report += "Native API: no signed-in TikTok session available in this app." }
-            self.savedReport = report
+                if let json = webResult { report += "Web client: \(json)\n" }
+                else { report += "Web client: timed out or page changed; keep the self-chat open during the test.\n" }
+                _ = try? await self.web.evaluateJavaScript("if (window.__stickerSavedDiagnostic?.token === \(tokenJSON)) delete window.__stickerSavedDiagnostic; true")
+            } catch { report += "Web client: inspection unavailable (WebKit error \((error as NSError).code))\n" }
+            // The authenticated iPhone v3 test already rejected every native route
+            // with HTTP 403. Do not repeat those requests in this web-only test.
+            self.savedReport = report + "Native API: prior iPhone test rejected all six routes with HTTP 403. Not repeated."
             self.testingSaved = false
-            self.status = "Saved test finished. Open the report; results do not yet prove transfer support."
+            self.status = "Web Saved test finished. Open the diagnostic report."
             self.showingReport = true
         }
     }
@@ -301,7 +279,7 @@ struct ProbeScreen: View {
                 Button("Reload") { model.web.reload() }
             }.buttonStyle(.bordered).tint(mint)
             Button("Check chat") { model.checkChat() }.buttonStyle(.bordered).tint(mint)
-            Button(model.testingSaved ? "Testing Saved…" : "Test Saved access") { model.testSaved() }
+            Button(model.testingSaved ? "Testing Saved…" : "Test Saved access · v4") { model.testSaved() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
             Text(model.status).font(.footnote).foregroundColor(.white).accessibilityLabel(model.status)
             BrowserSurface(web: model.web).clipShape(RoundedRectangle(cornerRadius: 16))
