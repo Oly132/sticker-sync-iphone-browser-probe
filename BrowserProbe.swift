@@ -7,7 +7,7 @@ struct BrowserProbeApp: App {
     var body: some Scene { WindowGroup { ProbeScreen() } }
 }
 
-final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
+final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     @Published var status = "Open TikTok and sign in, then try Messages."
     @Published var address = ""
     @Published var desktop = true
@@ -19,9 +19,22 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         config.defaultWebpagePreferences.preferredContentMode = .desktop
+        config.userContentController.addUserScript(WKUserScript(source: """
+        (() => {
+          if (!navigator.userAgent.includes('Windows NT')) return;
+          let meta = document.querySelector('meta[name="viewport"]');
+          if (!meta) {
+            meta = document.createElement('meta');
+            meta.name = 'viewport';
+            document.head.appendChild(meta);
+          }
+          meta.content = 'width=1280, initial-scale=0.25, user-scalable=yes';
+        })();
+        """, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         web = WKWebView(frame: .zero, configuration: config)
         super.init()
         web.navigationDelegate = self
+        web.uiDelegate = self
         web.customUserAgent = desktopAgent
         web.allowsBackForwardNavigationGestures = true
         web.isOpaque = true
@@ -45,6 +58,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         web.customUserAgent = desktop ? desktopAgent : nil
         web.configuration.defaultWebpagePreferences.preferredContentMode = desktop ? .desktop : .mobile
         load("https://www.tiktok.com/messages?lang=en")
+    }
+
+    func checkChat() {
+        diagnosticGeneration += 1
+        inspect(generation: diagnosticGeneration, remaining: 10)
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url, trusted(url) {
+            webView.load(navigationAction.request)
+        }
+        return nil
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
@@ -81,7 +107,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
           } catch (_) {}
           return {path: location.pathname,
             conversations: !!document.querySelector('[data-e2e="dm-new-conversation-list"]'),
-            chat: !!document.querySelector('[data-e2e="dm-new-chatbox"]'),
+            chat: (() => {
+              const header = document.querySelector('[data-e2e="dm-new-chatbox"] [class*="DivChatHeader"]');
+              return !!header && !!header.textContent.trim();
+            })(),
             signedIn: signedIn};
         })()
         """
@@ -93,10 +122,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
             }
             let path = result["path"] as? String ?? "/"
             let messages = result["conversations"] as? Bool ?? false
+            let chat = result["chat"] as? Bool ?? false
             let signedIn = result["signedIn"] as? Bool ?? false
             self.address = path
-            if messages {
-                self.status = "Messages list loaded. This proves web access only—not Saved sticker retrieval."
+            if chat {
+                self.status = "Conversation opened. Web chat works; Saved sticker retrieval is still unverified."
+            } else if messages {
+                self.status = "Messages loaded. Tap a conversation; pinch to zoom or swipe across the wide page, then tap Check chat."
             } else if remaining > 0 {
                 self.status = "Waiting for TikTok’s page to finish loading…"
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
@@ -135,6 +167,7 @@ struct ProbeScreen: View {
                 Button("Messages") { model.load("https://www.tiktok.com/messages?lang=en") }
                 Button("Reload") { model.web.reload() }
             }.buttonStyle(.bordered).tint(mint)
+            Button("Check chat") { model.checkChat() }.buttonStyle(.bordered).tint(mint)
             Text(model.status).font(.footnote).foregroundColor(.white).accessibilityLabel(model.status)
             BrowserSurface(web: model.web).clipShape(RoundedRectangle(cornerRadius: 16))
         }

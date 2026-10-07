@@ -23,4 +23,4 @@ Even success means only Messages web access is available. Android still obtains 
 - https://developer.apple.com/xcode/system-requirements
 - https://support.apple.com/en-au/guide/security/sec15bfe098e/web
 
-Swift source is prepared for review. Compilation and device validation are pending.
+The first cloud build compiled successfully and the user installed it on an iPhone 7 running iOS 15.8.8. Desktop identity allows the logged-in Messages list to load, but tapping a conversation did not open a usable chat in that first build. The revised probe adds a desktop-width viewport, permits TikTok HTTPS popup links to load in the same browser, and provides a Check chat diagnostic. This revision still needs device validation; no Saved retrieval has been proved.
