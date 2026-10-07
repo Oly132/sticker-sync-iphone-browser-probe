@@ -2,6 +2,7 @@ import SwiftUI
 import WebKit
 import UIKit
 import CryptoKit
+import CommonCrypto
 
 @main
 struct BrowserProbeApp: App {
@@ -428,6 +429,104 @@ enum NativeSigningCore {
         }
         return "8404b4d94000" + hex(input.map(UInt8.init))
     }
+    static func ror64(_ x: UInt64, _ n: Int) -> UInt64 { (x >> n) | (x << (64-n)) }
+    static func littleWord(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
+        (0..<8).reduce(UInt64(0)) { $0 | UInt64(bytes[offset+$1]) << ($1*8) }
+    }
+    static func littleBytes(_ x: UInt64) -> [UInt8] { (0..<8).map { UInt8(truncatingIfNeeded: x >> ($0*8)) } }
+    static func pad(_ bytes: [UInt8]) -> [UInt8] {
+        let count = 16 - bytes.count % 16
+        return bytes + [UInt8](repeating: UInt8(count), count: count)
+    }
+    static func ladon(timestamp: UInt32, salt: [UInt8]) -> String {
+        precondition(salt.count == 4)
+        let digest = hex(Array(Insecure.MD5.hash(data: Data(salt + Array("1233".utf8)))))
+        let material = Array(digest.utf8)
+        var previous=littleWord(material,0), queue=[littleWord(material,8),littleWord(material,16),littleWord(material,24)]
+        var keys=[previous]
+        for i in 0..<33 {
+            let next=(ror64(queue.removeFirst(),8) &+ previous) ^ UInt64(i)
+            queue.append(next)
+            previous=next ^ ror64(previous,61)
+            keys.append(previous)
+        }
+        let input=pad(Array("\(timestamp)-2142840551-1233".utf8))
+        var output=salt
+        for offset in stride(from:0,to:input.count,by:16) {
+            var a=littleWord(input,offset), b=littleWord(input,offset+8)
+            for key in keys { b=key ^ (a &+ ror64(b,8)); a=b ^ ror64(a,61) }
+            output += littleBytes(a) + littleBytes(b)
+        }
+        return Data(output).base64EncodedString()
+    }
+    static func simon(_ input: [UInt8], key: [UInt8]) -> [UInt8] {
+        precondition(input.count % 16 == 0 && key.count == 32)
+        var keys=(0..<4).map { littleWord(key,$0*8) }
+        let constant: UInt64 = 0x3dc94c3a046d678b
+        for i in 4..<72 {
+            var t=ror64(keys[i-1],3) ^ keys[i-3]
+            t ^= ror64(t,1)
+            keys.append(~keys[i-4] ^ t ^ ((constant >> ((i-4)%62)) & 1) ^ 3)
+        }
+        var output: [UInt8]=[]
+        for offset in stride(from:0,to:input.count,by:16) {
+            var a=littleWord(input,offset), b=littleWord(input,offset+8)
+            for key in keys {
+                let next=a ^ (ror64(b,63) & ror64(b,56)) ^ ror64(b,62) ^ key
+                a=b; b=next
+            }
+            output += littleBytes(a) + littleBytes(b)
+        }
+        return output
+    }
+    struct PB {
+        var bytes: [UInt8]=[]
+        mutating func rawVarint(_ input: UInt64) {
+            var value=input
+            while value>=128 { bytes.append(UInt8(value & 127)|128); value >>= 7 }
+            bytes.append(UInt8(value))
+        }
+        mutating func integer(_ field: UInt64,_ value: UInt64) { rawVarint(field<<3); rawVarint(value) }
+        mutating func data(_ field: UInt64,_ value: [UInt8]) { rawVarint((field<<3)|2); rawVarint(UInt64(value.count)); bytes += value }
+        mutating func text(_ field: UInt64,_ value: String) { data(field,Array(value.utf8)) }
+    }
+    enum SigningError: Error { case aesFailed }
+    static func aesCBC(_ input: [UInt8], key: [UInt8], iv: [UInt8]) throws -> [UInt8] {
+        guard key.count == 16 && iv.count == 16 else { throw SigningError.aesFailed }
+        var output=[UInt8](repeating:0,count:input.count+16), written=0
+        let capacity=output.count
+        let result = key.withUnsafeBytes { k in iv.withUnsafeBytes { v in input.withUnsafeBytes { p in output.withUnsafeMutableBytes { out in
+            CCCrypt(CCOperation(kCCEncrypt),CCAlgorithm(kCCAlgorithmAES),CCOptions(kCCOptionPKCS7Padding),
+                    k.baseAddress,key.count,v.baseAddress,p.baseAddress,input.count,out.baseAddress,capacity,&written)
+        }}}}
+        guard result == kCCSuccess else { throw SigningError.aesFailed }
+        return Array(output.prefix(written))
+    }
+    static func argus(query: String, deviceID: String, timestamp: UInt32, nonce: UInt32) throws -> String {
+        var pb=PB()
+        pb.integer(1,0x20200929<<1); pb.integer(2,2); pb.integer(3,UInt64(nonce))
+        pb.text(4,"1233"); pb.text(5,deviceID); pb.text(6,"2142840551")
+        pb.text(7,"v05.01.02-alpha.7-ov-android"); pb.text(8,"v05.01.02-alpha.7-ov-android")
+        pb.integer(9,83952160); pb.data(10,[UInt8](repeating:0,count:8)); pb.text(11,"android")
+        pb.integer(12,UInt64(timestamp)<<1); pb.data(13,Array(sm3([UInt8](repeating:0,count:16)).prefix(6)))
+        pb.data(14,Array(sm3(query.isEmpty ? [UInt8](repeating:0,count:16) : Array(query.utf8)).prefix(6)))
+        var counters=PB()
+        for field in [UInt64(1),2,3,5,6] { counters.integer(field,field==6 ? 170 : 85) }
+        counters.integer(7,(UInt64(timestamp)<<1)-310); pb.data(15,counters.bytes)
+        pb.text(16,deviceID); pb.text(20,"none"); pb.integer(21,738)
+        var device=PB()
+        device.text(1,"2203121C"); device.text(2,"9"); device.text(3,"googleplay"); device.integer(4,0x01009400<<1)
+        pb.data(23,device.bytes); pb.integer(25,2)
+        let key: [UInt8] = [0xfc,0x78,0xe0,0xa9,0x65,0x7a,0x0c,0x74,0x8c,0xe5,0x15,0x59,0x90,0x3c,0xcf,0x03,0x51,0x0e,0x51,0xd3,0xcf,0xf2,0x32,0xd7,0x13,0x43,0xe8,0x8a,0x32,0x1c,0x53,0x04]
+        let xor: [UInt8] = [0xf2,0xf7,0xfc,0xff,0xf2,0xf7,0xfc,0xff]
+        var encoded = xor + simon(pad(pb.bytes),key:key)
+        for i in 8..<encoded.count { encoded[i] ^= xor[i%8] }
+        let buffer: [UInt8] = [0xa6,0x6e,0xad,0x9f,0x77,0x01,0xd0,0x0c,0x18] + Array(encoded.reversed()) + [0x61,0x6f]
+        let signKey: [UInt8] = [0xac,0x1a,0xda,0xae,0x95,0xa7,0xaf,0x94,0xa5,0x11,0x4a,0xb3,0xb3,0xa9,0x7d,0xd8,0x00,0x50,0xaa,0x0a,0x39,0x31,0x4c,0x40,0x52,0x8c,0xae,0xc9,0x52,0x56,0xc2,0x8c]
+        let aesKey=Array(Insecure.MD5.hash(data:Data(signKey.prefix(16))))
+        let iv=Array(Insecure.MD5.hash(data:Data(signKey.suffix(16))))
+        return Data([0xf2,0x81] + (try aesCBC(buffer,key:aesKey,iv:iv))).base64EncodedString()
+    }
     static func selfTestFailures() -> [String] {
         var failures: [String] = []
         if hex(md5("abc")) != "900150983cd24fb0d6963f7d28e17f72" { failures.append("MD5 standard vector") }
@@ -443,6 +542,11 @@ enum NativeSigningCore {
         if gorgon(query: "aid=1233&cursor=0&count=20", cookie: nil, timestamp: 1700000000) != "8404b4d9400080395c76cf0918c5fbeac413362c8dbaebdbc250" { failures.append("Gorgon reference vector 0") }
         if gorgon(query: "aid=1233&cursor=0&count=20", cookie: "sessionid=TEST_ONLY", timestamp: 1700000000) != "8404b4d9400080395c76cf0918feee64538e362c8dbaebdbc250" { failures.append("Gorgon reference vector 1") }
         if gorgon(query: "", cookie: nil, timestamp: 1700000000) != "8404b4d94000c383773acf0918c5fbeac413362c8dbaebdbc292" { failures.append("Gorgon reference vector 2") }
+        if ladon(timestamp: 1700000000, salt: [1, 2, 3, 4]) != "AQIDBAg9q7y2FKMM0eeGFk1n4W/Q28AxEuIoF+PlPOv0uX8J" { failures.append("Ladon cross-implementation vector 0") }
+        if ladon(timestamp: 1700000011, salt: [1, 2, 3, 4]) != "AQIDBHORJ1wUm5sIC7JwffyEwZ/Q28AxEuIoF+PlPOv0uX8J" { failures.append("Ladon cross-implementation vector 1") }
+        do { if try argus(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", deviceID: "1234567890123456789", timestamp: 1700000000, nonce: 12345) != "8oGq9ypdP1R0Yt46uZPVHJHqYFS0vSftUDt8DpMHZDglY9Iiysy8LMUU9iNg1u8DPGexO0LNLtdl7TSrbLLZ1TkJU4T1/BhqlkPDyDC82laua2mtBpq/ZE1NS4wClgAnRCS4ocWgLl6CXjfJBcndZoXuVvKh4qObIZk1bxbCrnoT/0d3yMMb6jH6D3+0n65X5LFCjc19oKlqr/7U1Yt61NW2ftm7Xu2v3iN9zr5eb3R1Bk+WKUJieuU4rUOnL2eSshf5B3WzKvwpeoNjGFih2Td3lJSWJ4S9qn8mDmAjOaKwJH7kIHUs9uai32E67nT7u54oOMTIZXGsRhgnucBTMQOkluPtrZlDtLHzWCywXmICqLfo6ztQGvqBVqzapB4S4Jc=" { failures.append("Argus compatibility vector 0") } } catch { failures.append("Argus AES failure") }
+        do { if try argus(query: "aid=1233&device_id=1234567890123456789&device_type=2203121C&os_version=9&channel=googleplay&version_name=37.0.4&cursor=0&count=20", deviceID: "1234567890123456789", timestamp: 1700000011, nonce: 12345) != "8oGq9ypdP1R0Yt46uZPVHJHqYFS0vSftUDt8DpMHZDglY9Iiysy8LMUU9iNg1u8DPGexO0LNLtdl7TSrbLLZ1TkJU4T1/BhqlkPDyDC82laua4Jzt8nshHrvoWNFgblLMlFE3TrdnGjgi+M2GKC8zwDbvaMi93OAA7TRUHDvrofgt2Umqk2PyJXepRnpmb5/GnFXpPwXcWa3dyAIfm6quMNyB6FTASv33bmgzHO9muraZgGq4g2rWfcJnwx9fB7R4BaSNQ7421uqFH7aCaWisEZYM+N31vuFTLfOgdU5PY5I84RONS1Efqu/1l1UOWSKVmx+PlwXLCEU6NAIeWPmnf1IiF9cpz1n8+6w1ULUDro+Fu+IRutn1FjVrZR7hper6PY=" { failures.append("Argus compatibility vector 1") } } catch { failures.append("Argus AES failure") }
+        do { if hex(try aesCBC([107, 193, 190, 226, 46, 64, 159, 150, 233, 61, 126, 17, 115, 147, 23, 42], key: [43, 126, 21, 22, 40, 174, 210, 166, 171, 247, 21, 136, 9, 207, 79, 60], iv: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])) != "7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c" { failures.append("AES NIST/padding vector 0") } } catch { failures.append("AES failure") }
         // END REFERENCE VECTORS
         return failures
     }
