@@ -178,11 +178,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             savedReport="Signing self-tests failed. No requests made."; showingReport=true; return
         }
         diagnosticGeneration += 1; testingSaved=true
+        let generation = diagnosticGeneration
         status="Testing local request signatures. No messages will be sent."
         Task { @MainActor [weak self] in
             guard let self=self else { return }
             defer { self.testingSaved=false; self.showingReport=true }
-            var report="SIGNED SAVED EXPERIMENT v7\nRead-only; no messages sent.\nOffline crypto checks: passed (\(NativeSigningCore.checkCount) vectors).\nReference profile: Android 37.0.4; server-registered identity: not established.\n"
+            var report="SIGNED SAVED EXPERIMENT v8\nRead-only; no messages sent.\nOffline checks: passed (\(NativeSigningCore.checkCount) cases).\nReference profile: Android 37.0.4; server-registered identity: not established.\n"
             let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
                 self.web.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning:$0) }
             }
@@ -190,6 +191,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             let selected=cookies.filter {
                 let host=$0.domain.trimmingCharacters(in:CharacterSet(charactersIn:".")).lowercased()
                 return (host=="tiktok.com" || host.hasSuffix(".tiktok.com")) && allowed.contains($0.name)
+                    && ($0.expiresDate.map { $0 > Date() } ?? true)
+            }
+            guard generation == self.diagnosticGeneration else {
+                self.savedReport=report+"Page changed while preparing; no requests made. Try again after loading finishes."; return
             }
             guard selected.contains(where:{["sessionid","sessionid_ss","sid_tt"].contains($0.name)}) else {
                 self.savedReport=report+"No signed-in TikTok session available. Sign into TikTok first."; return
@@ -215,7 +220,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             defer { session.invalidateAndCancel() }
             let cases:[(String,Bool)]=[("v2",false),("v2",true),("v1",true)]
             for (version,signed) in cases {
-                guard let page=self.web.url,self.trusted(page) else { report += "Page changed; test stopped.\n"; break }
+                guard generation == self.diagnosticGeneration, let page=self.web.url,self.trusted(page) else { report += "Page changed; remaining requests stopped.\n"; break }
                 let label="\(signed ? "signed" : "unsigned") \(version)"
                 let url=URL(string:"https://\(host)/tiktok/\(version)/im/sticker/favorites?\(query)")!
                 var request=URLRequest(url:url);request.httpMethod="GET"
@@ -236,13 +241,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                 do {
                     let (data,response)=try await session.data(for:request)
                     let http=response as? HTTPURLResponse
-                    let json=data.count<2_000_000 ? (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] : nil
-                    let nested=json?["data"] as? [String:Any]
-                    let list=(json?["stickers"] ?? nested?["stickers"]) as? [Any]
-                    let code=(json?["status_code"] as? NSNumber)?.stringValue ?? "unavailable"
-                    let text=String(data:Data(data.prefix(100_000)),encoding:.utf8)?.lowercased() ?? ""
-                    report += "\(host) \(label): HTTP \(http?.statusCode ?? 0), JSON \(json != nil), status \(code), stickerArray \(list != nil), count \(list?.count ?? 0), accessDeniedText \(text.contains("access denied") || text.contains("accessdenied"))\n"
-                } catch { report += "\(host) \(label): request unavailable or timed out\n" }
+                    let evidence=NativeResponseEvidence.classify(data,contentType:http?.value(forHTTPHeaderField:"Content-Type"))
+                    report += "\(host) \(label): HTTP \(http?.statusCode ?? 0), \(evidence.report)\n"
+                } catch { report += "\(host) \(label): \(NativeResponseEvidence.errorLabel(error))\n" }
             }
             self.savedReport=report+"A matching signature is not proof of native login or Saved access. No transfers performed."
             self.status="Signed experiment finished. Copy the report for review."
@@ -402,7 +403,7 @@ struct ProbeScreen: View {
             Button("Check chat") { model.checkChat() }.buttonStyle(.bordered).tint(mint)
             Button(model.testingSaved ? "Testing Saved…" : "Test Saved access · v5") { model.testSaved() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
-            Button("Test signed request · v7") { model.testSignedNative() }
+            Button("Test signed request · v8") { model.testSignedNative() }
                 .buttonStyle(.bordered).tint(mint).disabled(model.testingSaved)
             Text(model.status).font(.footnote).foregroundColor(.white).accessibilityLabel(model.status)
             BrowserSurface(web: model.web).clipShape(RoundedRectangle(cornerRadius: 16))
@@ -441,8 +442,89 @@ struct ProbeScreen: View {
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+import CoreFoundation
+
+// Locally authored diagnostic classifier. Reports only fixed labels/counts.
+enum NativeResponseEvidence {
+    struct Summary {
+        let mime: String
+        let bytes: Int
+        let json: Bool
+        let status: String
+        let stickerArray: Bool
+        let count: Int
+        let objectCount: Int
+        let pagination: Bool
+        let denied: Bool
+        var report: String {
+            "mime \(mime), bytes \(bytes), JSON \(json), status \(status), stickerArray \(stickerArray), count \(count), objectCount \(objectCount), paginationFields \(pagination), accessDeniedText \(denied)"
+        }
+    }
+    static func classify(_ data: Data, contentType: String?) -> Summary {
+        let type = (contentType ?? "").split(separator:";").first?.trimmingCharacters(in:.whitespacesAndNewlines).lowercased() ?? ""
+        let mime = type == "application/json" || type.hasSuffix("+json") ? "json" :
+            type == "text/html" ? "html" : type == "application/octet-stream" ? "binary" :
+            type == "text/plain" ? "text" : type.isEmpty ? "missing" : "other"
+        let parsed = data.count <= 2_000_000 ? (try? JSONSerialization.jsonObject(with:data)) as? [String:Any] : nil
+        let nested = parsed?["data"] as? [String:Any]
+        let list = (parsed?["stickers"] as? [Any]) ?? (nested?["stickers"] as? [Any])
+        var status = "unavailable"
+        if let number = parsed?["status_code"] as? NSNumber,
+           CFGetTypeID(number) != CFBooleanGetTypeID(),
+           number.doubleValue.isFinite, abs(number.doubleValue) <= 2_147_483_647,
+           number.doubleValue.rounded() == number.doubleValue {
+            status = String(number.int64Value)
+        }
+        let pagination = (parsed?["cursor"] != nil && parsed?["has_more"] != nil) ||
+            (nested?["cursor"] != nil && nested?["has_more"] != nil)
+        let prefix = String(data:Data(data.prefix(100_000)),encoding:.utf8)?.lowercased() ?? ""
+        return Summary(mime:mime, bytes:data.count, json:parsed != nil, status:status,
+                       stickerArray:list != nil, count:list?.count ?? 0,
+                       objectCount:list?.filter { $0 is [String:Any] }.count ?? 0,
+                       pagination:pagination, denied:prefix.contains("access denied") || prefix.contains("accessdenied"))
+    }
+    static func errorLabel(_ error: Error) -> String {
+        let code = (error as NSError).code
+        guard (error as NSError).domain == NSURLErrorDomain else { return "request failed" }
+        switch code {
+        case NSURLErrorTimedOut: return "timed out"
+        case NSURLErrorNotConnectedToInternet: return "offline"
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed: return "DNS unavailable"
+        case NSURLErrorCannotConnectToHost: return "connection unavailable"
+        case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted,
+             NSURLErrorServerCertificateHasBadDate, NSURLErrorServerCertificateHasUnknownRoot,
+             NSURLErrorServerCertificateNotYetValid: return "TLS validation failed"
+        case NSURLErrorCancelled: return "cancelled"
+        default: return "request failed"
+        }
+    }
+    static func verificationCases() -> [(String,Bool)] {
+        func sample(_ value:String,_ mime:String? = "application/json") -> Summary { classify(Data(value.utf8),contentType:mime) }
+        let fallback = sample("{\"status_code\":0,\"status_msg\":\"\",\"log_pb\":{}}")
+        let empty = sample("{\"status_code\":0,\"stickers\":[]}")
+        let rows = sample("{\"status_code\":0,\"data\":{\"stickers\":[{\"sticker_id\":\"TEST\"}],\"cursor\":1,\"has_more\":false}}")
+        let privateSample = sample("{\"status_code\":0,\"status_msg\":\"FAKE_PRIVATE_VALUE\",\"device_token\":\"FAKE_PRIVATE_VALUE\",\"stickers\":[{\"url\":\"FAKE_PRIVATE_VALUE\"}]}","application/x-FAKE_PRIVATE_VALUE")
+        return [
+            ("generic fallback is not a list", fallback.json && !fallback.stickerArray && fallback.status == "0"),
+            ("empty array counted separately", empty.stickerArray && empty.count == 0),
+            ("nested list and pagination", rows.stickerArray && rows.count == 1 && rows.objectCount == 1 && rows.pagination),
+            ("malformed list rejected", !sample("{\"stickers\":\"FAKE\"}").stickerArray),
+            ("HTML denial classified", sample("<html>Access Denied</html>","text/html; charset=utf-8").denied),
+            ("binary is not JSON success", !classify(Data([0,255,3]),contentType:"application/octet-stream").json),
+            ("boolean status rejected", sample("{\"status_code\":true}").status == "unavailable"),
+            ("fractional status rejected", sample("{\"status_code\":0.5}").status == "unavailable"),
+            ("large JSON parsing bounded", !classify(Data(repeating:32,count:2_000_001),contentType:nil).json),
+            ("private response and MIME values omitted", !privateSample.report.contains("FAKE_PRIVATE_VALUE")),
+            ("error URL omitted", errorLabel(NSError(domain:NSURLErrorDomain,code:NSURLErrorTimedOut,userInfo:[NSLocalizedDescriptionKey:"FAKE_PRIVATE_VALUE"])) == "timed out"),
+            ("TLS validation error remains distinct", errorLabel(NSError(domain:NSURLErrorDomain,code:NSURLErrorServerCertificateUntrusted)) == "TLS validation failed")
+        ]
+    }
+    static var caseCount: Int { verificationCases().count }
+    static func selfTestFailures() -> [String] { verificationCases().filter { !$0.1 }.map { "Response diagnostic: " + $0.0 } }
+}
+
 enum NativeSigningCore {
-    static let checkCount = 24
+    static let checkCount = 24 + NativeResponseEvidence.caseCount
     static func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
     static func md5(_ text: String) -> [UInt8] { Array(Insecure.MD5.hash(data: Data(text.utf8))) }
     static func rotate(_ x: UInt32, _ n: Int) -> UInt32 {
@@ -676,7 +758,7 @@ enum NativeSigningCore {
         do { if try gzip([65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65, 65]) != [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 115, 116, 28, 30, 0, 0, 152, 61, 187, 40, 200, 0, 0, 0] { failures.append("Gzip independent vector 2") } } catch { failures.append("Gzip failure") }
         do { if hex(try deviceEnvelope(gzip: [31, 139, 8, 0, 0, 0, 0, 0, 0, 0, 115, 116, 28, 30, 0, 0, 152, 61, 187, 40, 200, 0, 0, 0], salt: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])) != "746305100000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ff964d20e50e09c9ed2085cbaeb9b64b0c234c20b8be11a9fcbdf3967fcec3c3811bd26705fec868f4e56478cb1be6e669008f79b08f7a1920457cdd528b245d8173b4ee8db003e389871049b11d4d35fa4132520353d3607aa4699d5eb4ed060" { failures.append("Device envelope independent vector 2") } } catch { failures.append("Device envelope failure") }
         // END REFERENCE VECTORS
-        return failures
+        return failures + NativeResponseEvidence.selfTestFailures()
     }
 }
 // END NATIVE SIGNING CORE
